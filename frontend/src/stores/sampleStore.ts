@@ -1,9 +1,10 @@
 import { create } from 'zustand';
 import { db, makeId, seedIfEmpty } from '../db';
-import type { AnalysisRecord } from '../types/analysis';
+import type { AnalysisInput, AnalysisRecord } from '../types/analysis';
 import type { FindRecord } from '../types/find';
 import type { MeteoriteSample } from '../types/sample';
 import type { ThinSection } from '../types/section';
+import { nextVersion } from '../utils/versionChain';
 
 export interface SampleState {
   samples: MeteoriteSample[];
@@ -19,7 +20,10 @@ export interface SampleState {
   addFind: (input: Omit<FindRecord, 'id' | 'createdAt'>) => Promise<string>;
   addSection: (input: Omit<ThinSection, 'id' | 'createdAt'>) => Promise<string>;
   updateSection: (id: string, patch: Partial<ThinSection>) => Promise<void>;
-  addAnalysis: (input: Omit<AnalysisRecord, 'id' | 'createdAt'>) => Promise<string>;
+  /** 首条检测直接成为当前判据；样本已有判据时记为待确认复测 */
+  addAnalysis: (input: AnalysisInput) => Promise<AnalysisRecord>;
+  /** 确认待确认复测：填写复核原因后取代当前判据，旧版转为历史版本 */
+  confirmAnalysis: (id: string, reviewReason: string) => Promise<boolean>;
   nextSampleSeq: () => number;
 }
 
@@ -98,10 +102,60 @@ export const useSampleStore = create<SampleState>((set, get) => ({
   },
 
   addAnalysis: async (input) => {
-    const record: AnalysisRecord = { ...input, id: makeId('analysis'), createdAt: Date.now() };
+    const siblings = get().analysis.filter((a) => a.sampleId === input.sampleId);
+    // 首条检测直接成为当前判据；复测先作为待确认结果，确认后才取代旧版
+    const status: AnalysisRecord['status'] = siblings.length === 0 ? 'current' : 'pending';
+    const record: AnalysisRecord = {
+      ...input,
+      id: makeId('analysis'),
+      createdAt: Date.now(),
+      status,
+      version: nextVersion(siblings),
+    };
     await db.analysis.add(record);
     set({ analysis: [record, ...get().analysis] });
-    return record.id;
+    return record;
+  },
+
+  confirmAnalysis: async (id, reviewReason) => {
+    const reason = reviewReason.trim();
+    if (!reason) return false;
+    const all = get().analysis;
+    const target = all.find((a) => a.id === id);
+    if (!target || target.status !== 'pending') return false;
+    const reviewedAt = Date.now();
+    const oldCurrent = all.find(
+      (a) => a.sampleId === target.sampleId && a.status === 'current',
+    );
+    await db.transaction('rw', db.analysis, async () => {
+      if (oldCurrent) {
+        await db.analysis.update(oldCurrent.id, { status: 'superseded' });
+      }
+      await db.analysis.update(id, {
+        status: 'current',
+        reviewReason: reason,
+        reviewedAt,
+        supersedesId: oldCurrent?.id,
+      });
+    });
+    set({
+      analysis: get().analysis.map((a) => {
+        if (oldCurrent && a.id === oldCurrent.id) {
+          return { ...a, status: 'superseded' as const };
+        }
+        if (a.id === id) {
+          return {
+            ...a,
+            status: 'current' as const,
+            reviewReason: reason,
+            reviewedAt,
+            supersedesId: oldCurrent?.id,
+          };
+        }
+        return a;
+      }),
+    });
+    return true;
   },
 
   nextSampleSeq: () => {

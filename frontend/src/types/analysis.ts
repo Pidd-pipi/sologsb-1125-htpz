@@ -6,6 +6,14 @@ export type AnalysisMethod = 'microprobe' | 'sem-eds';
 /** 检测对象类型 */
 export type AnalysisTarget = 'sample' | 'section';
 
+/**
+ * 版本链状态：
+ *  - current：当前判据，分类/推荐/列表只按它计算
+ *  - pending：待确认复测，填写复核原因并确认后才取代旧版
+ *  - superseded：历史版本，仍可查看，不能再次成为当前判据
+ */
+export type AnalysisStatus = 'current' | 'pending' | 'superseded';
+
 /** 分析检测结果（AnalysisRecord） */
 export interface AnalysisRecord {
   id: string;
@@ -26,7 +34,23 @@ export interface AnalysisRecord {
   /** 检测日期 YYYY-MM-DD */
   testedAt: string;
   createdAt: number;
+  /** 版本链状态（v4 新增；旧档案迁移时按检测日期回填） */
+  status: AnalysisStatus;
+  /** 同一样本内的版本序号，从 1 递增（v4 新增） */
+  version: number;
+  /** 复核原因：确认复测、取代旧版时必填 */
+  reviewReason?: string;
+  /** 复核确认时间戳 */
+  reviewedAt?: number;
+  /** 被本版本取代的旧记录 id */
+  supersedesId?: string;
 }
+
+/** 录入新检测记录时由调用方提供的字段（版本信息由 store 计算） */
+export type AnalysisInput = Omit<
+  AnalysisRecord,
+  'id' | 'createdAt' | 'status' | 'version' | 'reviewReason' | 'reviewedAt' | 'supersedesId'
+>;
 
 export const ANALYSIS_METHOD_LABELS: Record<AnalysisMethod, string> = {
   microprobe: '电子探针',
@@ -36,6 +60,12 @@ export const ANALYSIS_METHOD_LABELS: Record<AnalysisMethod, string> = {
 export const ANALYSIS_TARGET_LABELS: Record<AnalysisTarget, string> = {
   sample: '样本',
   section: '切片',
+};
+
+export const ANALYSIS_STATUS_LABELS: Record<AnalysisStatus, string> = {
+  current: '当前判据',
+  pending: '待确认',
+  superseded: '历史版本',
 };
 
 export const ANALYSIS_METHODS: AnalysisMethod[] = ['microprobe', 'sem-eds'];
@@ -74,8 +104,8 @@ export interface AnalysisEvaluation {
   advice: ClassificationAdvice;
 }
 
-/** 生成一条空检测记录骨架 */
-export function emptyAnalysisDraft(sampleId: string): Omit<AnalysisRecord, 'id' | 'createdAt'> {
+/** 生成一条空检测记录骨架（版本信息由 store 在保存时计算） */
+export function emptyAnalysisDraft(sampleId: string): AnalysisInput {
   return {
     sampleId,
     target: 'sample',

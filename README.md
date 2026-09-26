@@ -42,9 +42,9 @@ docker compose down
 | --- | --- | --- |
 | `/` | 样本总览：卡片流 + 分类/化学群/重量区间筛选与排序，缺坐标或缺切片显示角标 | MeteoriteSample |
 | `/samples/new` | 样本登记：编号生成、分类化学群、重量、存放位置，可补录发现地坐标并即时校验 | MeteoriteSample、FindRecord |
-| `/samples/:id` | 样本详情：基本信息 + 发现地摘要 + 切片列表 + 分析记录，可就地新增 | 四个模型 |
+| `/samples/:id` | 样本详情：基本信息 + 发现地摘要 + 切片列表 + 检测版本链（当前判据 / 待确认复测 / 历史版本），可就地新增 | 四个模型 |
 | `/sections` | 切片库：按厚度与矿物占比筛选，回跳样本，批量标注质量 | ThinSection、MeteoriteSample |
-| `/analysis` | 分析检测：录入 Fa / Fs / Ni / 铁纹石带宽，实时分类建议与阈值命中说明 | AnalysisRecord、MeteoriteSample |
+| `/analysis` | 分析检测：录入 Fa / Fs / Ni / 铁纹石带宽，实时分类建议与阈值命中说明；复测进入待确认队列，确认后取代当前判据 | AnalysisRecord、MeteoriteSample |
 | `/locations` | 发现地分布：SVG 网格按经纬度打点、按分类着色、点选弹出样本清单 | FindRecord、MeteoriteSample |
 
 ## 数据模型（`src/types/` 独立文件）
@@ -52,7 +52,16 @@ docker compose down
 - `types/sample.ts` — **MeteoriteSample**：id、样本编号、总重量 g、分类、化学群、风化等级 W0–W4、发现/坠落、存放位置
 - `types/find.ts` — **FindRecord**：id、关联样本、地名、国家地区、经纬度、坐标来源（GPS/文献）、发现环境、发现者
 - `types/section.ts` — **ThinSection**：id、切片编号、关联样本、厚度 μm、制样方式、矿物占比、显微照片清单
-- `types/analysis.ts` — **AnalysisRecord**：id、关联样本或切片、方法、橄榄石 Fa、辉石 Fs、Ni wt%、铁纹石带宽 mm、检测日期
+- `types/analysis.ts` — **AnalysisRecord**：id、关联样本或切片、方法、橄榄石 Fa、辉石 Fs、Ni wt%、铁纹石带宽 mm、检测日期、版本链（status / version / 复核原因）
+
+### 检测版本链
+
+同一样本的多次检测构成版本链，避免复测数值被当成同级结果导致分类建议来回变化：
+
+- 样本的**首条**检测直接成为**当前判据**（`current`）
+- 之后的复测先记为**待确认**（`pending`），不参与分类与列表计算
+- 在详情页或分析页填写**复核原因**并确认后，待确认版本取代旧版成为当前判据；旧版转为**历史版本**（`superseded`），仍可查看，但不能再次成为当前判据
+- 样本详情与分析页的分类、推荐与列表只按当前版本计算；旧档案没有版本信息时，按检测日期最近的一次作为当前结果（v4 迁移自动回填）
 
 ## 目录结构
 
@@ -73,11 +82,11 @@ sologsb-1125/
         ├── types/{sample,find,section,analysis}.ts
         ├── db/index.ts                 # Dexie 封装与 v1→v3 升级迁移
         ├── stores/{sampleStore,uiStore}.ts
-        ├── components/common/{SampleCard,Badge,FieldGroup,EmptyState,CoordinatePicker,AppShell}.tsx
+        ├── components/common/{SampleCard,Badge,FieldGroup,EmptyState,CoordinatePicker,AppShell,AnalysisStatusChip,ConfirmAnalysisDialog}.tsx
         ├── hooks/{useSampleFilter,useLocalDraft,useRegionStats}.ts
         ├── pages/{Overview,New,Detail,Sections,Analysis,Locations}.tsx
         ├── router/index.tsx
-        └── utils/{classify,format,geo}.ts
+        └── utils/{classify,format,geo,versionChain}.ts
 ```
 
 ## 数据存储说明
@@ -87,6 +96,7 @@ sologsb-1125/
   - v1 建 `samples` / `finds` / `sections`
   - v2 新增 `analysis` 表并加 `sampleId` 索引
   - v3 为 `samples` 补 `updatedAt` 字段并按 id 回填旧记录
+  - v4 为 `analysis` 引入版本链（`status` / `version`），旧档案按检测日期最近的一次置为当前判据，其余记为历史版本并按日期升序回填版本号
 - **草稿**：`/samples/new` 与 `/analysis` 的表单草稿写入 localStorage（键前缀 `gbmeteorite:draft:`），切页自动恢复，提交后清理
 - 首次打开会灌入 3 份演示样本、2 条发现记录、2 张切片与 2 条检测记录，便于直接体验筛选与打点
 

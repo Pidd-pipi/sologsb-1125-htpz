@@ -22,6 +22,8 @@ import SaveIcon from '@mui/icons-material/Save';
 import EmptyState from '../components/common/EmptyState';
 import ClassificationBadge from '../components/common/Badge';
 import FieldGroup from '../components/common/FieldGroup';
+import AnalysisStatusChip from '../components/common/AnalysisStatusChip';
+import ConfirmAnalysisDialog from '../components/common/ConfirmAnalysisDialog';
 import { useLocalDraft } from '../hooks/useLocalDraft';
 import { useSampleStore } from '../stores/sampleStore';
 import { useToastStore } from '../stores/uiStore';
@@ -31,9 +33,17 @@ import {
   ANALYSIS_TARGETS,
   ANALYSIS_TARGET_LABELS,
   type AnalysisMethod,
+  type AnalysisRecord,
   type AnalysisTarget,
 } from '../types/analysis';
 import { classifyByAnalysis, evaluateThresholds } from '../utils/classify';
+import {
+  nextVersion,
+  pendingAnalyses,
+  resolveCurrentAnalysis,
+  supersededAnalyses,
+  supersededBy,
+} from '../utils/versionChain';
 import { formatDate } from '../utils/format';
 
 interface AnalysisDraft {
@@ -73,6 +83,7 @@ export default function Analysis() {
 
   const { value, patch, reset, clear, restored } = useLocalDraft<AnalysisDraft>('analysis-entry', initial);
   const [error, setError] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState<AnalysisRecord | null>(null);
 
   const sampleSections = useMemo(
     () => sections.filter((s) => s.sampleId === value.sampleId),
@@ -82,6 +93,36 @@ export default function Analysis() {
   const hits = evaluateThresholds(value);
   const advice = classifyByAnalysis(value);
   const outOfRange = hits.filter((h) => !h.inRange);
+
+  /** 版本链视图：当前判据每样本一条，复测进入待确认队列 */
+  const sampleMap = useMemo(() => new Map(samples.map((s) => [s.id, s])), [samples]);
+  const bySample = useMemo(() => {
+    const m = new Map<string, AnalysisRecord[]>();
+    analysis.forEach((a) => {
+      const list = m.get(a.sampleId) ?? [];
+      list.push(a);
+      m.set(a.sampleId, list);
+    });
+    return m;
+  }, [analysis]);
+  const currentList = useMemo(
+    () =>
+      samples
+        .map((s) => resolveCurrentAnalysis(bySample.get(s.id) ?? []))
+        .filter((a): a is AnalysisRecord => !!a),
+    [samples, bySample],
+  );
+  const pendingList = useMemo(() => pendingAnalyses(analysis), [analysis]);
+  const supersededList = useMemo(() => supersededAnalyses(analysis), [analysis]);
+
+  const selectedRecords = useMemo(
+    () => analysis.filter((a) => a.sampleId === value.sampleId),
+    [analysis, value.sampleId],
+  );
+  const selectedCurrent = useMemo(
+    () => resolveCurrentAnalysis(selectedRecords),
+    [selectedRecords],
+  );
 
   const submit = async () => {
     if (!value.sampleId) {
@@ -93,7 +134,7 @@ export default function Analysis() {
       return;
     }
     setError(null);
-    await addAnalysis({
+    const record = await addAnalysis({
       sampleId: value.sampleId,
       sectionId: value.target === 'section' ? value.sectionId : undefined,
       target: value.target,
@@ -105,7 +146,12 @@ export default function Analysis() {
       testedAt: value.testedAt,
     });
     clear();
-    notify('检测记录已写入本地库');
+    notify(
+      record.status === 'pending'
+        ? `已保存为待确认复测 v${record.version}，填写复核原因并确认后才会取代当前判据`
+        : '检测记录已写入本地库，成为该样本当前判据',
+      record.status === 'pending' ? 'info' : 'success',
+    );
     patch({ fa: 18.5, fs: 16, ni: 0.8, kamaciteBandwidth: 0.05 });
   };
 
@@ -114,7 +160,8 @@ export default function Analysis() {
       <Box>
         <Typography variant="h4">分析检测</Typography>
         <Typography variant="body2" color="text.secondary">
-          录入 Fa / Fs / Ni / 铁纹石带宽，右侧实时给出分类建议与阈值命中说明。
+          录入 Fa / Fs / Ni / 铁纹石带宽，右侧实时给出分类建议与阈值命中说明。同一样本的复测先进入待确认队列，
+          填写复核原因并确认后才取代当前判据；分类与列表只按当前版本计算。
         </Typography>
       </Box>
 
@@ -253,9 +300,16 @@ export default function Analysis() {
                 />
               </Stack>
 
+              {selectedCurrent ? (
+                <Alert severity="info">
+                  该样本当前判据为 v{selectedCurrent.version}（{formatDate(selectedCurrent.testedAt)} 检测）。
+                  本次保存将记为待确认复测 v{nextVersion(selectedRecords)}，需填写复核原因并确认后才会取代当前判据。
+                </Alert>
+              ) : null}
+
               <Stack direction="row" spacing={1.5}>
                 <Button variant="contained" startIcon={<SaveIcon />} onClick={submit} id="save-analysis">
-                  保存检测记录
+                  {selectedCurrent ? '保存为待确认复测' : '保存检测记录'}
                 </Button>
                 <Button variant="outlined" onClick={reset}>
                   清空并重置草稿
@@ -269,7 +323,7 @@ export default function Analysis() {
           <Stack spacing={2.5}>
             <Paper variant="outlined" sx={{ p: 2.5 }}>
               <Typography variant="h6" sx={{ mb: 1 }}>
-                分类建议
+                分类建议（草稿预览）
               </Typography>
               <Stack spacing={1.25}>
                 <ClassificationBadge category={advice.category} showGroup={false} />
@@ -336,7 +390,7 @@ export default function Analysis() {
 
       <Paper variant="outlined" sx={{ p: 2.5 }}>
         <Typography variant="h6" sx={{ mb: 1.5 }}>
-          已录入检测记录（{analysis.length}）
+          检测版本链（当前判据 {currentList.length} · 待确认 {pendingList.length} · 历史 {supersededList.length}）
         </Typography>
         {analysis.length === 0 ? (
           <EmptyState
@@ -346,32 +400,143 @@ export default function Analysis() {
             actionTo="/samples/new"
           />
         ) : (
-          <Stack spacing={1}>
-            {analysis.slice(0, 12).map((a) => {
-              const s = samples.find((x) => x.id === a.sampleId);
-              const ev = classifyByAnalysis(a);
-              return (
-                <Box
-                  key={a.id}
-                  sx={{ border: '1px solid', borderColor: 'divider', borderRadius: 2, p: 1.5 }}
-                >
-                  <Stack direction="row" justifyContent="space-between" flexWrap="wrap" gap={1}>
-                    <Typography variant="subtitle2">
-                      {s ? s.sampleNo : '未知样本'} · {ANALYSIS_METHOD_LABELS[a.method]} ·{' '}
-                      {formatDate(a.testedAt)}
-                    </Typography>
-                    <ClassificationBadge category={ev.category} showGroup={false} />
-                  </Stack>
-                  <Typography variant="caption" color="text.secondary">
-                    Fa {a.fa} mol% · Fs {a.fs} mol% · Ni {a.ni} wt% · 带宽 {a.kamaciteBandwidth} mm ——{' '}
-                    {ev.summary}
-                  </Typography>
-                </Box>
-              );
-            })}
+          <Stack spacing={2.5}>
+            {pendingList.length > 0 ? (
+              <Box>
+                <Typography variant="subtitle1" fontWeight={700} sx={{ mb: 1 }}>
+                  待确认复测（{pendingList.length}）
+                </Typography>
+                <Stack spacing={1}>
+                  {pendingList.map((a) => {
+                    const s = sampleMap.get(a.sampleId);
+                    const current = resolveCurrentAnalysis(bySample.get(a.sampleId) ?? []);
+                    const ev = classifyByAnalysis(a);
+                    return (
+                      <Box
+                        key={a.id}
+                        sx={{
+                          border: '1px solid',
+                          borderColor: 'warning.main',
+                          borderRadius: 2,
+                          p: 1.5,
+                          bgcolor: 'rgba(237,108,2,0.04)',
+                        }}
+                      >
+                        <Stack direction="row" justifyContent="space-between" flexWrap="wrap" gap={1}>
+                          <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
+                            <Typography variant="subtitle2">
+                              {s ? s.sampleNo : '未知样本'} · {ANALYSIS_METHOD_LABELS[a.method]} ·{' '}
+                              {formatDate(a.testedAt)}
+                            </Typography>
+                            <AnalysisStatusChip record={a} />
+                          </Stack>
+                          <Button size="small" variant="contained" onClick={() => setConfirming(a)}>
+                            确认取代当前判据
+                          </Button>
+                        </Stack>
+                        <Typography variant="caption" color="text.secondary">
+                          Fa {a.fa} mol% · Fs {a.fs} mol% · Ni {a.ni} wt% · 带宽 {a.kamaciteBandwidth} mm ——{' '}
+                          {ev.summary}
+                          {current ? `（确认后取代 v${current.version}）` : ''}
+                        </Typography>
+                      </Box>
+                    );
+                  })}
+                </Stack>
+              </Box>
+            ) : null}
+
+            <Box>
+              <Typography variant="subtitle1" fontWeight={700} sx={{ mb: 1 }}>
+                当前判据（每样本一条）
+              </Typography>
+              {currentList.length === 0 ? (
+                <Alert severity="info">暂无当前判据。</Alert>
+              ) : (
+                <Stack spacing={1}>
+                  {currentList.map((a) => {
+                    const s = sampleMap.get(a.sampleId);
+                    const ev = classifyByAnalysis(a);
+                    return (
+                      <Box
+                        key={a.id}
+                        sx={{ border: '1px solid', borderColor: 'divider', borderRadius: 2, p: 1.5 }}
+                      >
+                        <Stack direction="row" justifyContent="space-between" flexWrap="wrap" gap={1}>
+                          <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
+                            <Typography variant="subtitle2">
+                              {s ? s.sampleNo : '未知样本'} · {ANALYSIS_METHOD_LABELS[a.method]} ·{' '}
+                              {formatDate(a.testedAt)}
+                            </Typography>
+                            <AnalysisStatusChip record={a} />
+                          </Stack>
+                          <ClassificationBadge category={ev.category} showGroup={false} />
+                        </Stack>
+                        <Typography variant="caption" color="text.secondary">
+                          Fa {a.fa} mol% · Fs {a.fs} mol% · Ni {a.ni} wt% · 带宽 {a.kamaciteBandwidth} mm ——{' '}
+                          {ev.summary}
+                        </Typography>
+                        {a.reviewReason ? (
+                          <Typography variant="caption" color="text.secondary" display="block">
+                            复核原因：{a.reviewReason}
+                          </Typography>
+                        ) : null}
+                      </Box>
+                    );
+                  })}
+                </Stack>
+              )}
+            </Box>
+
+            {supersededList.length > 0 ? (
+              <Box>
+                <Typography variant="subtitle1" fontWeight={700} color="text.secondary" sx={{ mb: 1 }}>
+                  历史版本（{supersededList.length}，只读）
+                </Typography>
+                <Stack spacing={1}>
+                  {supersededList.map((a) => {
+                    const s = sampleMap.get(a.sampleId);
+                    const replacement = supersededBy(analysis, a);
+                    return (
+                      <Box
+                        key={a.id}
+                        sx={{
+                          border: '1px solid',
+                          borderColor: 'divider',
+                          borderRadius: 2,
+                          p: 1.5,
+                          opacity: 0.65,
+                        }}
+                      >
+                        <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
+                          <Typography variant="subtitle2">
+                            {s ? s.sampleNo : '未知样本'} · {ANALYSIS_METHOD_LABELS[a.method]} ·{' '}
+                            {formatDate(a.testedAt)}
+                          </Typography>
+                          <AnalysisStatusChip record={a} />
+                          {replacement ? (
+                            <Chip size="small" variant="outlined" label={`被 v${replacement.version} 取代`} />
+                          ) : null}
+                        </Stack>
+                        <Typography variant="caption" color="text.secondary">
+                          Fa {a.fa} mol% · Fs {a.fs} mol% · Ni {a.ni} wt% · 带宽 {a.kamaciteBandwidth} mm
+                        </Typography>
+                      </Box>
+                    );
+                  })}
+                </Stack>
+              </Box>
+            ) : null}
           </Stack>
         )}
       </Paper>
+
+      <ConfirmAnalysisDialog
+        record={confirming}
+        current={confirming ? resolveCurrentAnalysis(bySample.get(confirming.sampleId) ?? []) : undefined}
+        sampleNo={confirming ? sampleMap.get(confirming.sampleId)?.sampleNo : undefined}
+        onClose={() => setConfirming(null)}
+      />
     </Stack>
   );
 }

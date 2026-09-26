@@ -12,6 +12,8 @@ export const DB_NAME = 'gbmeteorite-db';
  *  - v1：建 samples / finds / sections 三张表
  *  - v2：新增 analysis 表，并为 analysis 加 sampleId 索引
  *  - v3：为 samples 补 updatedAt 字段，并按 id 回填旧记录
+ *  - v4：analysis 引入版本链（status / version），旧档案按检测日期
+ *        最近的一次作为当前结果，其余记为历史版本
  */
 export class MeteoriteDB extends Dexie {
   samples!: Table<MeteoriteSample, string>;
@@ -64,6 +66,39 @@ export class MeteoriteDB extends Dexie {
                 typeof sample.createdAt === 'number' ? sample.createdAt : Date.now();
             }
           });
+      });
+
+    this.version(4)
+      .stores({
+        samples:
+          'id, sampleNo, category, chemicalGroup, totalWeight, createdAt, updatedAt',
+        finds: 'id, sampleId, region, createdAt',
+        sections: 'id, sectionNo, sampleId, thickness, createdAt',
+        analysis: 'id, sampleId, sectionId, method, testedAt, createdAt',
+      })
+      .upgrade(async (tx) => {
+        // v4：检测记录引入版本链。旧档案没有版本信息，
+        // 按检测日期最近的一次作为当前结果，其余记为历史版本，
+        // 版本号按检测日期升序回填。
+        const table = tx.table<AnalysisRecord, string>('analysis');
+        const all = await table.toArray();
+        const bySample = new Map<string, AnalysisRecord[]>();
+        for (const rec of all) {
+          const list = bySample.get(rec.sampleId) ?? [];
+          list.push(rec);
+          bySample.set(rec.sampleId, list);
+        }
+        for (const list of bySample.values()) {
+          const ordered = [...list].sort((a, b) => {
+            const t = (a.testedAt ?? '').localeCompare(b.testedAt ?? '');
+            return t !== 0 ? t : a.createdAt - b.createdAt;
+          });
+          ordered.forEach((rec, idx) => {
+            rec.version = idx + 1;
+            rec.status = idx === ordered.length - 1 ? 'current' : 'superseded';
+          });
+          await table.bulkPut(ordered);
+        }
       });
   }
 }
@@ -185,6 +220,8 @@ export async function seedIfEmpty(): Promise<void> {
         kamaciteBandwidth: 0.02,
         testedAt: '2024-06-12',
         createdAt: now - 86400000 * 20,
+        status: 'current',
+        version: 1,
       },
       {
         id: 'analysis_seed_2',
@@ -197,6 +234,8 @@ export async function seedIfEmpty(): Promise<void> {
         kamaciteBandwidth: 0.62,
         testedAt: '2024-07-03',
         createdAt: now - 86400000 * 12,
+        status: 'current',
+        version: 1,
       },
     ]);
   });
