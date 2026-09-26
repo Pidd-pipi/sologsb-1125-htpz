@@ -12,6 +12,8 @@ export const DB_NAME = 'gbmeteorite-db';
  *  - v1：建 samples / finds / sections 三张表
  *  - v2：新增 analysis 表，并为 analysis 加 sampleId 索引
  *  - v3：为 samples 补 updatedAt 字段，并按 id 回填旧记录
+ *  - v4：analysis 引入版本链（version / status / supersedesId），
+ *        旧档案没有版本信息时按检测日期最近的一次作为当前判据，其余标记为已被取代
  */
 export class MeteoriteDB extends Dexie {
   samples!: Table<MeteoriteSample, string>;
@@ -64,6 +66,41 @@ export class MeteoriteDB extends Dexie {
                 typeof sample.createdAt === 'number' ? sample.createdAt : Date.now();
             }
           });
+      });
+
+    this.version(4)
+      .stores({
+        samples:
+          'id, sampleNo, category, chemicalGroup, totalWeight, createdAt, updatedAt',
+        finds: 'id, sampleId, region, createdAt',
+        sections: 'id, sectionNo, sampleId, thickness, createdAt',
+        analysis: 'id, sampleId, sectionId, method, testedAt, createdAt, status',
+      })
+      .upgrade(async (tx) => {
+        // v4：旧档案没有版本信息，按样本分组后依检测日期排序编号，
+        // 日期最近的一次作为当前判据，其余标记为已被取代并串成链
+        const table = tx.table<AnalysisRecord, string>('analysis');
+        const all = await table.toArray();
+        const bySample = new Map<string, AnalysisRecord[]>();
+        all.forEach((rec) => {
+          const list = bySample.get(rec.sampleId) ?? [];
+          list.push(rec);
+          bySample.set(rec.sampleId, list);
+        });
+        for (const list of bySample.values()) {
+          list.sort(
+            (a, b) => a.testedAt.localeCompare(b.testedAt) || a.createdAt - b.createdAt,
+          );
+          for (let i = 0; i < list.length; i++) {
+            const rec = list[i];
+            const isLatest = i === list.length - 1;
+            await table.update(rec.id, {
+              version: typeof rec.version === 'number' ? rec.version : i + 1,
+              status: rec.status ?? (isLatest ? 'current' : 'superseded'),
+              supersedesId: rec.supersedesId ?? (i > 0 ? list[i - 1].id : undefined),
+            });
+          }
+        }
       });
   }
 }
@@ -184,6 +221,10 @@ export async function seedIfEmpty(): Promise<void> {
         ni: 0.8,
         kamaciteBandwidth: 0.02,
         testedAt: '2024-06-12',
+        version: 1,
+        status: 'current',
+        reviewReason: '首次建档检测，直接作为当前判据',
+        confirmedAt: now - 86400000 * 20,
         createdAt: now - 86400000 * 20,
       },
       {
@@ -196,6 +237,10 @@ export async function seedIfEmpty(): Promise<void> {
         ni: 7.4,
         kamaciteBandwidth: 0.62,
         testedAt: '2024-07-03',
+        version: 1,
+        status: 'current',
+        reviewReason: '首次建档检测，直接作为当前判据',
+        confirmedAt: now - 86400000 * 12,
         createdAt: now - 86400000 * 12,
       },
     ]);

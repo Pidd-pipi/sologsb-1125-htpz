@@ -19,7 +19,8 @@ export interface SampleState {
   addFind: (input: Omit<FindRecord, 'id' | 'createdAt'>) => Promise<string>;
   addSection: (input: Omit<ThinSection, 'id' | 'createdAt'>) => Promise<string>;
   updateSection: (id: string, patch: Partial<ThinSection>) => Promise<void>;
-  addAnalysis: (input: Omit<AnalysisRecord, 'id' | 'createdAt'>) => Promise<string>;
+  addAnalysis: (input: Omit<AnalysisRecord, 'id' | 'createdAt' | 'version' | 'status'>) => Promise<string>;
+  confirmAnalysis: (id: string, reviewReason: string) => Promise<void>;
   nextSampleSeq: () => number;
 }
 
@@ -98,10 +99,60 @@ export const useSampleStore = create<SampleState>((set, get) => ({
   },
 
   addAnalysis: async (input) => {
-    const record: AnalysisRecord = { ...input, id: makeId('analysis'), createdAt: Date.now() };
+    // 复测记录先作为待确认版本进入版本链，确认后才取代旧判据
+    const mine = get().analysis.filter((a) => a.sampleId === input.sampleId);
+    const version = mine.reduce((max, a) => Math.max(max, a.version ?? 0), 0) + 1;
+    const record: AnalysisRecord = {
+      ...input,
+      id: makeId('analysis'),
+      createdAt: Date.now(),
+      version,
+      status: 'pending',
+    };
     await db.analysis.add(record);
     set({ analysis: [record, ...get().analysis] });
     return record.id;
+  },
+
+  confirmAnalysis: async (id, reviewReason) => {
+    const all = get().analysis;
+    const target = all.find((a) => a.id === id);
+    if (!target || target.status !== 'pending') return;
+    const reason = reviewReason.trim();
+    if (!reason) return;
+    const confirmedAt = Date.now();
+    // 单向链：旧当前版被取代后只能查看，不能再次成为当前判据
+    const prevCurrent = all.find(
+      (a) => a.sampleId === target.sampleId && a.status === 'current',
+    );
+    await db.transaction('rw', db.analysis, async () => {
+      if (prevCurrent) {
+        await db.analysis.update(prevCurrent.id, { status: 'superseded' });
+      }
+      await db.analysis.update(id, {
+        status: 'current',
+        reviewReason: reason,
+        confirmedAt,
+        supersedesId: prevCurrent?.id,
+      });
+    });
+    set({
+      analysis: get().analysis.map((a) => {
+        if (prevCurrent && a.id === prevCurrent.id) {
+          return { ...a, status: 'superseded' as const };
+        }
+        if (a.id === id) {
+          return {
+            ...a,
+            status: 'current' as const,
+            reviewReason: reason,
+            confirmedAt,
+            supersedesId: prevCurrent?.id,
+          };
+        }
+        return a;
+      }),
+    });
   },
 
   nextSampleSeq: () => {

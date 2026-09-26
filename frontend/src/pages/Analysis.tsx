@@ -31,9 +31,11 @@ import {
   ANALYSIS_TARGETS,
   ANALYSIS_TARGET_LABELS,
   type AnalysisMethod,
+  type AnalysisRecord,
   type AnalysisTarget,
 } from '../types/analysis';
 import { classifyByAnalysis, evaluateThresholds } from '../utils/classify';
+import { currentAnalysisOf, hasPendingAnalysis } from '../utils/versions';
 import { formatDate } from '../utils/format';
 
 interface AnalysisDraft {
@@ -83,6 +85,19 @@ export default function Analysis() {
   const advice = classifyByAnalysis(value);
   const outOfRange = hits.filter((h) => !h.inRange);
 
+  // 列表只按当前版本计算：每个样本取当前判据（旧档案回退到检测日期最近的一次）
+  const currentList = useMemo(() => {
+    const sampleIds = [...new Set(analysis.map((a) => a.sampleId))];
+    return sampleIds
+      .map((sid) => currentAnalysisOf(analysis, sid))
+      .filter((a): a is AnalysisRecord => Boolean(a))
+      .sort((a, b) => b.createdAt - a.createdAt);
+  }, [analysis]);
+  const pendingCount = useMemo(
+    () => analysis.filter((a) => a.status === 'pending').length,
+    [analysis],
+  );
+
   const submit = async () => {
     if (!value.sampleId) {
       setError('请先选择关联样本');
@@ -90,6 +105,10 @@ export default function Analysis() {
     }
     if (value.target === 'section' && !value.sectionId) {
       setError('检测对象为切片时必须选择一张切片');
+      return;
+    }
+    if (hasPendingAnalysis(analysis, value.sampleId)) {
+      setError('该样本已有待确认版本，请先到样本详情页填写复核原因并确认，再录入新的复测');
       return;
     }
     setError(null);
@@ -105,7 +124,7 @@ export default function Analysis() {
       testedAt: value.testedAt,
     });
     clear();
-    notify('检测记录已写入本地库');
+    notify('检测记录已保存为待确认版本，请到样本详情页填写复核原因并确认', 'info');
     patch({ fa: 18.5, fs: 16, ni: 0.8, kamaciteBandwidth: 0.05 });
   };
 
@@ -114,7 +133,7 @@ export default function Analysis() {
       <Box>
         <Typography variant="h4">分析检测</Typography>
         <Typography variant="body2" color="text.secondary">
-          录入 Fa / Fs / Ni / 铁纹石带宽，右侧实时给出分类建议与阈值命中说明。
+          录入 Fa / Fs / Ni / 铁纹石带宽，右侧实时给出分类建议与阈值命中说明；保存后先作为待确认版本，确认后才成为当前判据。
         </Typography>
       </Box>
 
@@ -336,18 +355,23 @@ export default function Analysis() {
 
       <Paper variant="outlined" sx={{ p: 2.5 }}>
         <Typography variant="h6" sx={{ mb: 1.5 }}>
-          已录入检测记录（{analysis.length}）
+          当前判据列表（{currentList.length}）
         </Typography>
-        {analysis.length === 0 ? (
+        {pendingCount > 0 ? (
+          <Alert severity="info" sx={{ mb: 1.5 }}>
+            另有 {pendingCount} 条待确认复测版本，确认前不参与分类与推荐；请到对应样本详情页填写复核原因并确认。
+          </Alert>
+        ) : null}
+        {currentList.length === 0 ? (
           <EmptyState
-            title="还没有检测记录"
-            description="在上方选择样本、填写 Fa / Fs / Ni 与铁纹石带宽后保存。"
+            title="还没有已确认的当前判据"
+            description="在上方选择样本、填写 Fa / Fs / Ni 与铁纹石带宽后保存，再到样本详情页确认版本。"
             actionLabel="去登记样本"
             actionTo="/samples/new"
           />
         ) : (
           <Stack spacing={1}>
-            {analysis.slice(0, 12).map((a) => {
+            {currentList.slice(0, 12).map((a) => {
               const s = samples.find((x) => x.id === a.sampleId);
               const ev = classifyByAnalysis(a);
               return (
@@ -357,7 +381,7 @@ export default function Analysis() {
                 >
                   <Stack direction="row" justifyContent="space-between" flexWrap="wrap" gap={1}>
                     <Typography variant="subtitle2">
-                      {s ? s.sampleNo : '未知样本'} · {ANALYSIS_METHOD_LABELS[a.method]} ·{' '}
+                      {s ? s.sampleNo : '未知样本'} · v{a.version} · {ANALYSIS_METHOD_LABELS[a.method]} ·{' '}
                       {formatDate(a.testedAt)}
                     </Typography>
                     <ClassificationBadge category={ev.category} showGroup={false} />

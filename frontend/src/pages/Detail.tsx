@@ -27,8 +27,10 @@ import { useToastStore } from '../stores/uiStore';
 import {
   ANALYSIS_METHODS,
   ANALYSIS_METHOD_LABELS,
+  ANALYSIS_STATUS_LABELS,
   ANALYSIS_THRESHOLDS,
   type AnalysisMethod,
+  type AnalysisStatus,
 } from '../types/analysis';
 import {
   MINERAL_KEYS,
@@ -49,6 +51,7 @@ import {
 } from '../types/sample';
 import { FIND_ENVIRONMENT_LABELS, COORDINATE_SOURCE_LABELS } from '../types/find';
 import { classifyByAnalysis, evaluateThresholds } from '../utils/classify';
+import { currentAnalysisOf, hasPendingAnalysis, supersededByOf, versionChainOf } from '../utils/versions';
 import { formatDate, formatNumber, formatWeight } from '../utils/format';
 import { formatCoordinate } from '../utils/geo';
 
@@ -61,6 +64,7 @@ export default function Detail() {
   const analysis = useSampleStore((s) => s.analysis);
   const addSection = useSampleStore((s) => s.addSection);
   const addAnalysis = useSampleStore((s) => s.addAnalysis);
+  const confirmAnalysis = useSampleStore((s) => s.confirmAnalysis);
   const updateSample = useSampleStore((s) => s.updateSample);
   const notify = useToastStore((s) => s.notify);
 
@@ -68,6 +72,10 @@ export default function Detail() {
   const find = useMemo(() => finds.find((f) => f.sampleId === id), [finds, id]);
   const mySections = useMemo(() => sections.filter((s) => s.sampleId === id), [sections, id]);
   const myAnalysis = useMemo(() => analysis.filter((a) => a.sampleId === id), [analysis, id]);
+  // 版本链：最新版在前；当前判据唯一，分类与推荐只按它计算
+  const chain = useMemo(() => versionChainOf(analysis, id), [analysis, id]);
+  const current = useMemo(() => currentAnalysisOf(analysis, id), [analysis, id]);
+  const hasPending = useMemo(() => hasPendingAnalysis(analysis, id), [analysis, id]);
 
   const [sectionDraft, setSectionDraft] = useState({
     sectionNo: '',
@@ -85,6 +93,8 @@ export default function Detail() {
     kamaciteBandwidth: 0.05,
     testedAt: new Date().toISOString().slice(0, 10),
   });
+  /** 各待确认版本的复核原因输入 */
+  const [reviewReasons, setReviewReasons] = useState<Record<string, string>>({});
 
   if (!sample) {
     return (
@@ -102,6 +112,19 @@ export default function Detail() {
   const mineralSum = mineralTotal(sectionDraft.minerals);
   const advice = classifyByAnalysis(analysisDraft);
   const hits = evaluateThresholds(analysisDraft);
+  // 分类与推荐只按当前版本计算，待确认与旧版不参与存档查看
+  const currentAdvice = current ? classifyByAnalysis(current) : null;
+
+  const statusChipColor = (status: AnalysisStatus): 'success' | 'warning' | 'default' =>
+    status === 'current' ? 'success' : status === 'pending' ? 'warning' : 'default';
+
+  const confirmVersion = async (recordId: string) => {
+    const reason = (reviewReasons[recordId] ?? '').trim();
+    if (!reason) return;
+    await confirmAnalysis(recordId, reason);
+    setReviewReasons((m) => ({ ...m, [recordId]: '' }));
+    notify('已确认新版本并取代旧判据，旧版转入存档');
+  };
 
   const submitSection = async () => {
     const no = sectionDraft.sectionNo.trim() || `TS-${new Date().getFullYear()}-${mySections.length + 1}`.padEnd(3, '0');
@@ -119,6 +142,10 @@ export default function Detail() {
   };
 
   const submitAnalysis = async () => {
+    if (hasPending) {
+      notify('已有待确认版本，请先填写复核原因并确认，再录入新的复测', 'warning');
+      return;
+    }
     await addAnalysis({
       sampleId: sample.id,
       target: 'sample',
@@ -129,7 +156,7 @@ export default function Detail() {
       kamaciteBandwidth: Number(analysisDraft.kamaciteBandwidth),
       testedAt: analysisDraft.testedAt,
     });
-    notify(`已为 ${sample.sampleNo} 写入一条检测记录`);
+    notify(`已为 ${sample.sampleNo} 写入待确认版本，填写复核原因并确认后才会成为当前判据`, 'info');
   };
 
   return (
@@ -414,41 +441,126 @@ export default function Detail() {
         <Grid item xs={12} md={5}>
           <Paper variant="outlined" sx={{ p: 2.5 }}>
             <Typography variant="h6" sx={{ mb: 1.5 }}>
-              分析检测记录（{myAnalysis.length}）
+              分析检测版本链（{myAnalysis.length} 版）
             </Typography>
-            {myAnalysis.length === 0 ? (
-              <Alert severity="info">暂无检测记录。</Alert>
+
+            {current && currentAdvice ? (
+              <Box
+                sx={{
+                  mb: 2,
+                  p: 1.5,
+                  border: '1px solid',
+                  borderColor: 'success.main',
+                  borderRadius: 2,
+                  bgcolor: 'rgba(46,125,50,0.05)',
+                }}
+              >
+                <Stack spacing={1}>
+                  <Stack direction="row" justifyContent="space-between" alignItems="center" flexWrap="wrap" gap={1}>
+                    <Typography variant="subtitle2">
+                      当前判据 · v{current.version} · {ANALYSIS_METHOD_LABELS[current.method]} ·{' '}
+                      {formatDate(current.testedAt)}
+                    </Typography>
+                    <ClassificationBadge category={currentAdvice.category} showGroup={false} />
+                  </Stack>
+                  <Typography variant="body2" color="text.secondary">
+                    Fa {formatNumber(current.fa, 2, ' mol%')} · Fs {formatNumber(current.fs, 2, ' mol%')} ·
+                    Ni {formatNumber(current.ni, 2, ' wt%')} · 带宽{' '}
+                    {formatNumber(current.kamaciteBandwidth, 3, ' mm')}
+                  </Typography>
+                  <Typography variant="body2">{currentAdvice.summary}</Typography>
+                  <Typography variant="caption" color="text.secondary">
+                    命中说明：{currentAdvice.hits.join('；')}
+                  </Typography>
+                  {current.reviewReason ? (
+                    <Typography variant="caption" color="text.secondary">
+                      复核原因：{current.reviewReason}
+                    </Typography>
+                  ) : null}
+                </Stack>
+              </Box>
             ) : (
+              <Alert severity="info" sx={{ mb: 2 }}>
+                暂无已确认的当前判据{chain.length > 0 ? '，请先确认下方待确认版本' : '，录入检测数值后确认即可建立'}。
+              </Alert>
+            )}
+
+            {chain.length > 0 ? (
               <Stack spacing={1.25} sx={{ mb: 2 }}>
-                {myAnalysis.map((a) => {
-                  const a2 = classifyByAnalysis(a);
+                {chain.map((a) => {
+                  const replacedBy = a.status === 'superseded' ? supersededByOf(analysis, a) : undefined;
                   return (
                     <Box
                       key={a.id}
-                      sx={{ border: '1px solid', borderColor: 'divider', borderRadius: 2, p: 1.5 }}
+                      sx={{
+                        border: '1px solid',
+                        borderColor: a.status === 'current' ? 'success.main' : 'divider',
+                        borderRadius: 2,
+                        p: 1.5,
+                        opacity: a.status === 'superseded' ? 0.75 : 1,
+                      }}
                     >
                       <Stack direction="row" justifyContent="space-between" flexWrap="wrap" gap={1}>
                         <Typography variant="subtitle2">
-                          {ANALYSIS_METHOD_LABELS[a.method]} · {a.testedAt}
+                          v{a.version} · {ANALYSIS_METHOD_LABELS[a.method]} · {formatDate(a.testedAt)}
                         </Typography>
-                        <ClassificationBadge category={a2.category} showGroup={false} />
+                        <Chip
+                          size="small"
+                          color={statusChipColor(a.status)}
+                          variant={a.status === 'superseded' ? 'outlined' : 'filled'}
+                          label={ANALYSIS_STATUS_LABELS[a.status]}
+                        />
                       </Stack>
                       <Typography variant="body2" color="text.secondary">
                         Fa {formatNumber(a.fa, 2, ' mol%')} · Fs {formatNumber(a.fs, 2, ' mol%')} · Ni{' '}
                         {formatNumber(a.ni, 2, ' wt%')} · 带宽 {formatNumber(a.kamaciteBandwidth, 3, ' mm')}
                       </Typography>
-                      <Typography variant="caption" color="text.secondary">
-                        {a2.summary}
-                      </Typography>
+                      {a.reviewReason ? (
+                        <Typography variant="caption" color="text.secondary" display="block">
+                          复核原因：{a.reviewReason}
+                        </Typography>
+                      ) : null}
+                      {a.status === 'superseded' ? (
+                        <Typography variant="caption" color="text.secondary" display="block">
+                          {replacedBy ? `已被 v${replacedBy.version} 取代，` : '已被取代，'}
+                          仅存档查看，不能再次成为当前判据。
+                        </Typography>
+                      ) : null}
+                      {a.status === 'pending' ? (
+                        <Stack spacing={1} sx={{ mt: 1 }}>
+                          <TextField
+                            id={`review-reason-${a.id}`}
+                            size="small"
+                            label="复核原因（确认前必填）"
+                            value={reviewReasons[a.id] ?? ''}
+                            onChange={(e) =>
+                              setReviewReasons((m) => ({ ...m, [a.id]: e.target.value }))
+                            }
+                            fullWidth
+                          />
+                          <Button
+                            size="small"
+                            variant="contained"
+                            disabled={!(reviewReasons[a.id] ?? '').trim()}
+                            onClick={() => confirmVersion(a.id)}
+                            sx={{ alignSelf: 'flex-start' }}
+                          >
+                            确认并设为当前判据
+                          </Button>
+                        </Stack>
+                      ) : null}
                     </Box>
                   );
                 })}
               </Stack>
-            )}
+            ) : null}
 
             <Divider sx={{ my: 2 }} />
             <Typography variant="subtitle1" fontWeight={700} sx={{ mb: 1 }}>
-              就地录入检测数值
+              就地录入复测数值
+            </Typography>
+            <Typography variant="caption" color="text.secondary" sx={{ mb: 1 }} display="block">
+              保存后先作为待确认版本进入版本链，填写复核原因并确认后才会取代当前判据。
             </Typography>
             <Stack spacing={1.5}>
               <Stack direction="row" spacing={1.5} flexWrap="wrap" useFlexGap>
@@ -534,10 +646,16 @@ export default function Detail() {
                 startIcon={<AddIcon />}
                 onClick={submitAnalysis}
                 id="add-analysis"
+                disabled={hasPending}
                 sx={{ alignSelf: 'flex-start' }}
               >
-                写入检测记录
+                写入待确认版本
               </Button>
+              {hasPending ? (
+                <Typography variant="caption" color="warning.main">
+                  当前有待确认版本，版本链串行推进：确认后才会开放下一次复测录入。
+                </Typography>
+              ) : null}
               <Typography variant="caption" color="text.secondary">
                 阈值参考：
                 {ANALYSIS_THRESHOLDS.map((t) => `${t.label} ${t.min}~${t.max}${t.unit}`).join(' · ')}

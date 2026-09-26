@@ -6,7 +6,13 @@ export type AnalysisMethod = 'microprobe' | 'sem-eds';
 /** 检测对象类型 */
 export type AnalysisTarget = 'sample' | 'section';
 
-/** 分析检测结果（AnalysisRecord） */
+/**
+ * 版本状态：复测记录先进入「待确认」，填写复核原因并确认后成为「当前判据」，
+ * 被取代的旧版进入「已被取代」——可查看，但不能再次成为当前判据（单向链）。
+ */
+export type AnalysisStatus = 'pending' | 'current' | 'superseded';
+
+/** 分析检测结果（AnalysisRecord），同一样本下按 version 递增形成版本链 */
 export interface AnalysisRecord {
   id: string;
   /** 关联样本 id */
@@ -25,6 +31,16 @@ export interface AnalysisRecord {
   kamaciteBandwidth: number;
   /** 检测日期 YYYY-MM-DD */
   testedAt: string;
+  /** 同一样本内的版本号，从 1 开始递增 */
+  version: number;
+  /** 版本状态：待确认 / 当前判据 / 已被取代 */
+  status: AnalysisStatus;
+  /** 复核原因（确认为当前判据时必填） */
+  reviewReason?: string;
+  /** 确认为当前判据的时间戳 */
+  confirmedAt?: number;
+  /** 本版本取代的记录 id（版本链指针） */
+  supersedesId?: string;
   createdAt: number;
 }
 
@@ -40,6 +56,12 @@ export const ANALYSIS_TARGET_LABELS: Record<AnalysisTarget, string> = {
 
 export const ANALYSIS_METHODS: AnalysisMethod[] = ['microprobe', 'sem-eds'];
 export const ANALYSIS_TARGETS: AnalysisTarget[] = ['sample', 'section'];
+
+export const ANALYSIS_STATUS_LABELS: Record<AnalysisStatus, string> = {
+  pending: '待确认',
+  current: '当前判据',
+  superseded: '已被取代',
+};
 
 /** 阈值定义：用于分类建议与命中说明 */
 export interface AnalysisThreshold {
@@ -74,8 +96,10 @@ export interface AnalysisEvaluation {
   advice: ClassificationAdvice;
 }
 
-/** 生成一条空检测记录骨架 */
-export function emptyAnalysisDraft(sampleId: string): Omit<AnalysisRecord, 'id' | 'createdAt'> {
+/** 生成一条空检测记录骨架（版本号与状态由 store 在写入时分配） */
+export function emptyAnalysisDraft(
+  sampleId: string,
+): Omit<AnalysisRecord, 'id' | 'createdAt' | 'version' | 'status'> {
   return {
     sampleId,
     target: 'sample',
